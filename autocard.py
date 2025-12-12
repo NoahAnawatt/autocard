@@ -75,6 +75,7 @@ PROMPT_TEMPLATE = """
 You are generating HIGH-DENSITY and EXHAUSTIVE flashcards.
 Ignore any content that is not relevant to the topic of {topic}.
 Extract EVERY detail. Every fact → at least one flashcard.
+Each flashcard should be useful for studying for an exam.
 If there are no relevant details, print "NONE".
 Aim to produce {limit} cards, unless there are more important details.
 Output EXACTLY one question<TAB>answer per line, no numbering, no markdown.
@@ -86,6 +87,11 @@ Text:
 
 Flashcards:
 """
+
+if Path("./prompt.acd").is_file():
+    with open("./prompt.acd") as promptFile:
+        PROMPT_TEMPLATE = promptFile.read()
+        print('Loaded alternate prompt')
 
 def build_prompt(topic, chunk, limit):
     return PROMPT_TEMPLATE.format(topic=topic, chunk=chunk,limit=limit)
@@ -114,6 +120,41 @@ def ollama_worker(model, prompt, line_queue, stop_event):
         proc.wait()
     except Exception as e:
         line_queue.put(f"[ERROR] Ollama worker failed: {e}")
+
+def chunk_worker(cfg, task_queue, line_queue, stop_event):
+    """Worker that processes DIFFERENT chunks by pulling from task_queue."""
+    while not stop_event.is_set():
+        try:
+            chunk_index, pass_num, chunk = task_queue.get(timeout=0.1)
+        except queue.Empty:
+            return
+
+        prompt = build_prompt(cfg["topic"], chunk, cfg["target_cards"])
+
+        try:
+            proc = subprocess.Popen(
+                ["ollama", "run", cfg["model"]],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1
+            )
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+
+            for line in proc.stdout:
+                if stop_event.is_set():
+                    break
+                line_queue.put((chunk_index, pass_num, line.rstrip("\n")))
+
+            proc.stdout.close()
+            proc.wait()
+
+        except Exception as e:
+            line_queue.put((chunk_index, pass_num, f"[ERROR] Worker failed: {e}"))
+
+        task_queue.task_done()
 
 # =====================
 # FLASHCARD EXTRACTION (TAB OR <TAB>)
@@ -253,82 +294,126 @@ def config_modal(stdscr, cfg, dashboard=None):
 # =====================
 # GENERATOR LOOP
 # =====================
-def run_generator(stdscr,infile,outfile,cfg):
+def run_generator(stdscr, infile, outfile, cfg):
     curses.curs_set(0)
+
+    # Load input text & chunk it
     text = Path(infile).read_text(encoding="utf-8")
-    chunks = list(chunk_text(text,cfg["chunk_size"],cfg["overlap"]))
-    if cfg["chunk_order"]=="reverse": chunks=list(reversed(chunks))
-    elif cfg["chunk_order"]=="random": random.shuffle(chunks)
-    dash = Dashboard(stdscr,len(chunks))
+    chunks = list(chunk_text(text, cfg["chunk_size"], cfg["overlap"]))
+    if cfg["chunk_order"] == "reverse":
+        chunks = list(reversed(chunks))
+    elif cfg["chunk_order"] == "random":
+        random.shuffle(chunks)
+
+    dash = Dashboard(stdscr, len(chunks))
     dash.draw()
-    Path(outfile).write_text("",encoding="utf-8")
+
+    # Reset output file
+    Path(outfile).write_text("", encoding="utf-8")
     tsv_count = 0
+
+    # Shared thread state
     stop_event = threading.Event()
     line_queue = queue.Queue()
-    write_lock = threading.Lock()  # lock for file writes
+    task_queue = queue.Queue()
+    write_lock = threading.Lock()
 
-    for ci,chunk in enumerate(chunks,start=1):
-        dash.chunk=ci
-        chunk_preview = chunk.replace("\n"," ").strip()
+    # -------------------------
+    # Build task queue
+    # -------------------------
+    for ci, chunk in enumerate(chunks, start=1):
+        chunk_preview = chunk.replace("\n", " ").strip()
         if len(chunk_preview) > 100:
-            chunk_preview = chunk_preview[:100]+"..."
+            chunk_preview = chunk_preview[:100] + "..."
         dash.log_event(f"Chunk preview: {chunk_preview}", "DEBUG")
 
-        for p in range(1,cfg["num_passes"]+1):
-            dash.pass_num=p
-            prompt = build_prompt(cfg["topic"],chunk,cfg['target_cards'])
-            prompt_preview = prompt.replace("\n"," ").strip()
-            if len(prompt_preview) > 200:
-                prompt_preview = prompt_preview[:200]+"..."
-            dash.log_event(f"Prompt preview: {prompt_preview}", "DEBUG")
-            dash.log_event(f"Processing chunk {ci}/{len(chunks)}, pass {p}/{cfg['num_passes']}")
+        for p in range(1, cfg["num_passes"] + 1):
+            task_queue.put((ci, p, chunk))
 
-            # start multithreaded Ollama workers
+    # -------------------------
+    # Start parallel workers
+    # -------------------------
+    workers = []
+    for _ in range(cfg["num_threads"]):
+        t = threading.Thread(
+            target=chunk_worker,
+            args=(cfg, task_queue, line_queue, stop_event),
+            daemon=True
+        )
+        t.start()
+        workers.append(t)
+
+    dash.log_event(f"Started {len(workers)} parallel chunk workers", "INFO")
+
+    # -------------------------
+    # Process model output lines
+    # -------------------------
+    while any(w.is_alive() for w in workers) or not line_queue.empty():
+        try:
+            ci, p, line = line_queue.get(timeout=0.1)
+        except queue.Empty:
+            dash.draw()
+            continue
+
+        dash.chunk = ci
+        dash.pass_num = p
+        dash.log_event(f"Ollama output: {line}", "INFO")
+
+        # Extract flashcards from the line
+        for extracted in extract_lines([line], cfg["output_format"]):
+            with write_lock:
+                with open(outfile, "a", encoding="utf-8") as f:
+                    f.write(extracted)
+
+            tsv_count += 1
+            dash.flashcards = tsv_count
+            dash.log_event(f"Extracted: {extracted.strip()}", "DEBUG")
+
+        line_queue.task_done()
+        dash.draw()
+
+        # Handle keyboard input
+        stdscr.nodelay(True)
+        key = stdscr.getch()
+
+        if key == ord('q'):
+            stop_event.set()
+            break
+
+        elif key == ord('c'):
+            # Pause workers
+            stop_event.set()
+            for w in workers:
+                w.join()
+
+            # change config
+            config_modal(stdscr, cfg, dashboard=dash)
+
+            # Resume
+            stop_event.clear()
             workers = []
-            for _ in range(cfg.get("num_threads",1)):
-                worker = threading.Thread(target=ollama_worker, args=(cfg["model"], prompt, line_queue, stop_event))
-                worker.start()
-                workers.append(worker)
-            dash.log_event(f"{len(workers)} Ollama workers started", "DEBUG")
+            for _ in range(cfg["num_threads"]):
+                t = threading.Thread(
+                    target=chunk_worker,
+                    args=(cfg, task_queue, line_queue, stop_event),
+                    daemon=True
+                )
+                t.start()
+                workers.append(t)
+            dash.log_event("Workers restarted after config change", "DEBUG")
 
-            while any(w.is_alive() for w in workers) or not line_queue.empty():
-                try:
-                    line = line_queue.get(timeout=0.1)
-                    dash.log_event(f"Ollama output: {line}", "INFO")
-                    for extracted in extract_lines([line],cfg["output_format"]):
-                        with write_lock:
-                            with open(outfile,"a",encoding="utf-8") as f:
-                                f.write(extracted)
-                        tsv_count+=1
-                        dash.flashcards=tsv_count
-                        dash.log_event(f"Extracted flashcard: {extracted.strip()}", "DEBUG")
-                except queue.Empty:
-                    pass
+    # -------------------------
+    # Shutdown
+    # -------------------------
+    stop_event.set()
+    task_queue.join()
 
-                # keys
-                stdscr.nodelay(True)
-                key = stdscr.getch()
-                if key==ord('q'): stop_event.set(); [w.join() for w in workers]; return
-                elif key==ord('c'):
-                    stop_event.set()
-                    [w.join() for w in workers]
-                    config_modal(stdscr,cfg,dashboard=dash)
-                    stop_event.clear()
-                    # restart workers
-                    workers = []
-                    for _ in range(cfg.get("num_threads",1)):
-                        worker = threading.Thread(target=ollama_worker, args=(cfg["model"], prompt, line_queue, stop_event))
-                        worker.start()
-                        workers.append(worker)
-                    dash.log_event(f"Ollama workers restarted after config change", "DEBUG")
-
-                dash.draw()
-                time.sleep(0.05)
-            [w.join() for w in workers]
-            dash.log_event("Ollama workers finished for this pass", "INFO")
+    for w in workers:
+        w.join()
 
     dash.log_event("All chunks processed. Done!", "INFO")
     dash.draw()
+
     stdscr.nodelay(False)
     stdscr.getch()
 
