@@ -76,10 +76,14 @@ You are generating HIGH-DENSITY and EXHAUSTIVE flashcards.
 Ignore any content that is not relevant to the topic of {topic}.
 Extract EVERY detail. Every fact → at least one flashcard.
 Each flashcard should be useful for studying for an exam.
+Each flashcard must have a stand-alone question. 
+Cards about key terms must ask the question as "What is a [key term]?"
 If there are no relevant details, print "NONE".
 Aim to produce {limit} cards, unless there are more important details.
 Output EXACTLY one question<TAB>answer per line, no numbering, no markdown.
-
+Output Template:
+[Question] <TAB> [Answer]
+=========================
 Text:
 =========================
 {chunk}
