@@ -4,6 +4,8 @@ from pathlib import Path
 from datetime import datetime
 import threading, queue
 
+VERSION = 1.1
+
 # =====================
 # DEFAULT CONFIG + DESCRIPTIONS
 # =====================
@@ -38,6 +40,18 @@ CONFIG_FILE = Path("flashcards.conf")
 # =====================
 # CONFIG UTILITIES
 # =====================
+def check_ollama_running():
+    try:
+        subprocess.run(
+            ["ollama", "list"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True
+        )
+        return True
+    except Exception:
+        return False
+
 def load_config():
     if CONFIG_FILE.exists():
         try:
@@ -229,7 +243,7 @@ class Dashboard:
         self.stdscr.erase()
         h,w = self.stdscr.getmaxyx()
         try:
-            self.stdscr.addstr(0,0,"FLASHCARD GENERATOR — Color Dashboard",curses.color_pair(1)|curses.A_BOLD)
+            self.stdscr.addstr(0,0,f"Autocard {VERSION}",curses.color_pair(1)|curses.A_BOLD)
             self.stdscr.addstr(2,0,f"Chunk: {self.chunk}/{self.total_chunks}",curses.color_pair(4))
             self.stdscr.addstr(3,0,f"Pass:  {self.pass_num}",curses.color_pair(4))
             pct = int((self.chunk/self.total_chunks)*100) if self.total_chunks else 0
@@ -311,6 +325,7 @@ def run_generator(stdscr, infile, outfile, cfg):
 
     dash = Dashboard(stdscr, len(chunks))
     dash.draw()
+    dash.log_event("Starting up ...","INFO")
 
     # Reset output file
     Path(outfile).write_text("", encoding="utf-8")
@@ -385,6 +400,7 @@ def run_generator(stdscr, infile, outfile, cfg):
             break
 
         elif key == ord('c'):
+            dash.log_event("Paused execution for configuration.","INFO")
             # Pause workers
             stop_event.set()
             for w in workers:
@@ -426,8 +442,11 @@ def run_generator(stdscr, infile, outfile, cfg):
 # =====================
 def main(stdscr):
     if len(sys.argv)!=3:
-        print("Usage: flashcards.py [input.txt] [output.tsv]")
+        print("Usage: flashcards.py [input.txt] [output.tsv]",flush=True)
         sys.exit(1)
+    if not check_ollama_running():
+        print("ERROR: Ollama is not running. Start it with 'ollama serve'",flush=True)
+        sys.exit(2)
     infile = sys.argv[1]
     outfile = sys.argv[2]
     cfg = load_config()
@@ -436,4 +455,5 @@ def main(stdscr):
 
 if __name__=="__main__":
     curses.wrapper(main)
+
 
