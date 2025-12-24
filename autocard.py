@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-import sys, subprocess, curses, time, json, random, re
+import sys, subprocess, curses, time, json, random, re, threading
 from pathlib import Path
-from datetime import datetime
 
-VERSION = 2.5
+VERSION = 2.8  # Updated version
 
 # =====================
-# DEFAULT CONFIG + DESCRIPTIONS
+# DEFAULT CONFIG
 # =====================
 DEFAULT_CONFIG = {
     "model": "llama3:8b",
@@ -35,7 +34,6 @@ CONFIG_DESC = {
 }
 
 CONFIG_FILE = Path("flashcards.conf")
-REJECTED_FILE = "rejected.tsv"
 
 # =====================
 # PROMPTS
@@ -43,13 +41,14 @@ REJECTED_FILE = "rejected.tsv"
 PROMPT_TEMPLATE = """
 You are generating HIGH-DENSITY and EXHAUSTIVE flashcards.
 Ignore any content that is not relevant to the topic of {topic}.
-Extract EVERY detail. Every fact → at least one flashcard.
+Extract EVERY detail. Each fact → at least one flashcard.
 Each flashcard should be useful for studying for an exam.
-Each flashcard must have a stand-alone question. 
+Each flashcard must have a stand-alone question.
 Cards about key terms must ask the question as "What is a [key term]?"
 If there are no relevant details, print "NONE".
 Aim to produce {limit} cards.
-Output EXACTLY one question<TAB>answer per line, no numbering, no markdown.
+Output EXACTLY one card per line per line, no numbering, no markdown.
+Card Template: question<TAB>answer
 
 Text:
 {chunk}
@@ -58,9 +57,12 @@ Flashcards:
 """
 
 VALIDATION_PROMPT = """
-Verify that the following flashcard is useful and relevant.
+Verify that the following flashcard is useful and relevant for studying.
 It should regard the topic(s) of {topic}.
 Respond only YES if the card is good and only NO if the card is bad.
+A card is bad if it will not lead to increased mastery of the topic.
+A card is bad if it is not formatted correctly.
+Format: Question <TAB indicator (broad indicators accepted)> Answer
 """
 
 if Path("./prompt.acd").is_file():
@@ -108,31 +110,6 @@ def chunk_text(text, size, overlap):
         yield text[start:end]
         start = end - overlap if end - overlap > start else end
 
-def extract_lines(lines, output_format="tsv"):
-    for line in lines:
-        line = line.strip()
-        if not line or line.upper() == "NONE": continue
-        if "<TAB>" in line: line=line.replace("<TAB>","\t")
-        if "\t" in line:
-            q,a = map(str.strip,line.split("\t",1))
-        elif "  " in line:
-            parts = re.split(r"\s{2,}", line, maxsplit=1)
-            if len(parts)!=2: continue
-            q,a = map(str.strip,parts)
-        else:
-            continue
-        if not q or not a: continue
-        if output_format=="tsv": yield f"{q}\t{a}\n"
-        elif output_format=="csv":
-            import csv
-            from io import StringIO
-            out=StringIO()
-            writer=csv.writer(out)
-            writer.writerow([q,a])
-            yield out.getvalue()
-        elif output_format=="jsonl":
-            yield json.dumps({"question":q,"answer":a})+"\n"
-
 # =====================
 # DASHBOARD
 # =====================
@@ -151,6 +128,9 @@ class Dashboard:
         self.spinner_index = 0
         self.chunk_pass_history = []
         self.max_rows = max_rows
+        self.start_time = time.time()
+        self.lock = threading.Lock()
+        self.running = True
         curses.start_color()
         curses.use_default_colors()
         curses.init_pair(1, curses.COLOR_GREEN, -1)
@@ -158,11 +138,27 @@ class Dashboard:
         curses.init_pair(3, curses.COLOR_RED, -1)
         curses.init_pair(4, curses.COLOR_CYAN, -1)
         curses.init_pair(5, curses.COLOR_WHITE, -1)
+        threading.Thread(target=self.spinner_loop, daemon=True).start()
 
     def log_event(self, msg, level="INFO"):
-        ts = datetime.now().strftime("%H:%M:%S")
-        formatted = f"[{ts}][{level}] {msg}"
-        self.logs.append(formatted)
+        elapsed = int(time.time() - self.start_time)
+        h = elapsed // 3600
+        m = (elapsed % 3600) // 60
+        s = elapsed % 60
+        ts = f"{h:02d}:{m:02d}:{s:02d}"
+        with self.lock:
+            formatted = f"[{ts}][{level}] {msg}"
+            self.logs.append(formatted)
+            if len(self.logs) > 1000:
+                self.logs = self.logs[-1000:]
+            self.live_lines.append(formatted)
+
+    def spinner_loop(self):
+        while self.running:
+            with self.lock:
+                self.spinner_index += 1
+            time.sleep(0.1)
+            self.draw()
 
     def draw_graph(self, row, w):
         total = max(1, self.generated)
@@ -192,45 +188,45 @@ class Dashboard:
                 x += 1
 
     def draw(self):
-        self.stdscr.erase()
-        h, w = self.stdscr.getmaxyx()
-        try:
-            self.stdscr.addstr(0,0,f"Autocard {VERSION}",curses.color_pair(1)|curses.A_BOLD)
-            self.stdscr.addstr(2,0,f"Chunk: {self.chunk}/{self.total_chunks}",curses.color_pair(4))
-            self.stdscr.addstr(3,0,f"Pass:  {self.pass_num}",curses.color_pair(4))
-            pct = int((self.chunk/self.total_chunks)*100) if self.total_chunks else 0
-            bar_width = min(30,w-20)
-            filled = int(bar_width*pct/100)
-            bar = "[" + "#"*filled + "-"*(bar_width-filled) + "]"
-            self.stdscr.addstr(4,0,f"Progress: {bar} {pct}%",curses.color_pair(1))
-            spinner = self.SPINNER[self.spinner_index % len(self.SPINNER)]
-            self.stdscr.addstr(5,0,f"Running: {spinner}",curses.color_pair(2))
+        with self.lock:
+            self.stdscr.erase()
+            h, w = self.stdscr.getmaxyx()
+            try:
+                self.stdscr.addstr(0,0,f"Autocard {VERSION}",curses.color_pair(1)|curses.A_BOLD)
+                self.stdscr.addstr(2,0,f"Chunk: {self.chunk}/{self.total_chunks}",curses.color_pair(4))
+                self.stdscr.addstr(3,0,f"Pass:  {self.pass_num}",curses.color_pair(4))
+                pct = int((self.chunk/self.total_chunks)*100) if self.total_chunks else 0
+                bar_width = min(30,w-20)
+                filled = int(bar_width*pct/100)
+                bar = "[" + "#"*filled + "-"*(bar_width-filled) + "]"
+                self.stdscr.addstr(4,0,f"Progress: {bar} {pct}%",curses.color_pair(1))
+                spinner = self.SPINNER[self.spinner_index % len(self.SPINNER)]
+                self.stdscr.addstr(5,0,f"Running: {spinner}",curses.color_pair(2))
 
-            # Chunk/pass matrix
-            graph_w = 30
-            graph_h = min(self.max_rows, len(self.chunk_pass_history))
-            self.draw_chunk_matrix(2, w - graph_w - 1, graph_h, graph_w)
+                # Chunk/pass matrix
+                graph_w = 30
+                graph_h = min(self.max_rows, len(self.chunk_pass_history))
+                self.draw_chunk_matrix(2, w - graph_w - 1, graph_h, graph_w)
 
-            # Main graph
-            graph_row = 7
-            self.draw_graph(graph_row, w)
+                # Main graph
+                graph_row = 7
+                self.draw_graph(graph_row, w)
 
-            # Live generated lines
-            live_start = graph_row + 2
-            max_lines = h - live_start - 2
-            lines_to_show = self.live_lines[-max_lines:] if self.live_lines else []
-            for i in range(max_lines):
-                if i < len(lines_to_show):
-                    line = lines_to_show[i]
-                    self.stdscr.addstr(live_start + i, 0, line[:w-1], curses.color_pair(5))
-                else:
-                    self.stdscr.addstr(live_start + i, 0, " "*(w-1))
+                # Live generated lines
+                live_start = graph_row + 2
+                max_lines = h - live_start - 2
+                lines_to_show = self.live_lines[-max_lines:] if self.live_lines else []
+                for i in range(max_lines):
+                    if i < len(lines_to_show):
+                        line = lines_to_show[i]
+                        self.stdscr.addstr(live_start + i, 0, line[:w-1], curses.color_pair(5))
+                    else:
+                        self.stdscr.addstr(live_start + i, 0, " "*(w-1))
 
-            self.stdscr.addstr(h-1,0,"Press 'c' for config | 'q' to quit",curses.color_pair(5)|curses.A_BOLD)
-        except curses.error:
-            pass
-        self.stdscr.refresh()
-        self.spinner_index += 1
+                self.stdscr.addstr(h-1,0,"Press 'c' for config | 'q' to quit",curses.color_pair(5)|curses.A_BOLD)
+            except curses.error:
+                pass
+            self.stdscr.refresh()
 
 # =====================
 # CONFIG MODAL
@@ -277,7 +273,7 @@ def config_modal(stdscr,cfg,dashboard=None):
     if dashboard: dashboard.draw()
 
 # =====================
-# GENERATION + VALIDATION + LIVE DISPLAY
+# RUN GENERATOR
 # =====================
 def run_generator(stdscr,infile,outfile,cfg):
     curses.curs_set(0)
@@ -287,16 +283,15 @@ def run_generator(stdscr,infile,outfile,cfg):
     elif cfg["chunk_order"]=="random": random.shuffle(chunks)
 
     dash = Dashboard(stdscr,len(chunks))
-    dash.draw()
     dash.log_event("Starting up ...", "INFO")
 
     Path(outfile).write_text("",encoding="utf-8")
-    Path(REJECTED_FILE).write_text("",encoding="utf-8")
 
     for ci, chunk in enumerate(chunks, start=1):
         dash.chunk = ci
         dash.pass_num = 0
         dash.live_lines = []
+        dash.log_event(f"Processing chunk {ci}/{len(chunks)} preview: {chunk[:50]}...", "INFO")
         chunk_generated = []
 
         for p in range(1, cfg["num_passes"]+1):
@@ -318,7 +313,7 @@ def run_generator(stdscr,infile,outfile,cfg):
                     line = proc.stdout.readline()
                     if not line:
                         if proc.poll() is not None: break
-                        time.sleep(0.01)
+                        time.sleep(0.05)
                         dash.draw()
                         stdscr.nodelay(True)
                         key = stdscr.getch()
@@ -329,19 +324,24 @@ def run_generator(stdscr,infile,outfile,cfg):
                     if not line: continue
                     chunk_generated.append(line)
                     dash.generated += 1
-                    dash.live_lines.append(line)
                     dash.log_event(f"Generated card: {line}", "INFO")
                     dash.draw()
             except Exception as e:
-                dash.log_event(f"[ERROR] Generation failed: {e}", "ERROR")
+                dash.log_event(f"Generation failed: {e}", "ERROR")
 
-        # Validation
+        # Per-chunk validation
         validated_lines = []
         for line in chunk_generated:
+            # Normalize line to TSV format: replace <TAB>, "TAB", multiple spaces with a real tab
+            line = re.sub(r"<TAB>|TAB", "\t", line, flags=re.IGNORECASE)  # replace placeholders
+            line = re.sub(r" {2,}", "\t", line)  # replace 2+ spaces with a tab
+            line = line.strip()
+
             if cfg.get("validate","true").lower() != "true":
                 validated_lines.append(line)
                 dash.validated += 1
                 continue
+
             val_prompt = VALIDATION_PROMPT.format(topic=cfg["topic"]) + "\n" + line
             try:
                 val_proc = subprocess.Popen(
@@ -354,8 +354,6 @@ def run_generator(stdscr,infile,outfile,cfg):
                 stdout_val,_ = val_proc.communicate(val_prompt, timeout=30)
                 if "NO" in stdout_val.upper():
                     dash.rejected += 1
-                    with open(REJECTED_FILE,"a",encoding="utf-8") as f:
-                        f.write(line+"\n")
                     dash.log_event(f"Rejected card: {line}", "WARN")
                 else:
                     validated_lines.append(line)
@@ -363,18 +361,21 @@ def run_generator(stdscr,infile,outfile,cfg):
                     dash.log_event(f"Validated card: {line}", "INFO")
                 dash.draw()
             except Exception as e:
-                dash.log_event(f"[ERROR] Validation failed: {e}", "ERROR")
+                dash.log_event(f"Validation failed: {e}", "ERROR")
                 dash.draw()
 
+
+        # Write only validated cards
         with open(outfile,"a",encoding="utf-8") as f:
             for line in validated_lines:
                 f.write(line+"\n")
 
         dash.chunk_pass_history.append([(len(chunk_generated), dash.validated, dash.rejected)])
 
-    dash.log_event("All chunks processed. Done!","INFO")
+    dash.log_event("All chunks processed. Done!", "INFO")
     dash.draw()
     stdscr.nodelay(False)
+    dash.running = False
     stdscr.getch()
 
 # =====================
@@ -398,4 +399,3 @@ def check_environment():
 if __name__=="__main__":
     check_environment()
     curses.wrapper(main)
-
