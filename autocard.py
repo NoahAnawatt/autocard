@@ -2,9 +2,8 @@
 import sys, subprocess, curses, time, json, random, re
 from pathlib import Path
 from datetime import datetime
-import threading, queue
 
-VERSION = 1.1
+VERSION = 2.5
 
 # =====================
 # DEFAULT CONFIG + DESCRIPTIONS
@@ -18,8 +17,8 @@ DEFAULT_CONFIG = {
     "max_tokens": 2048,
     "chunk_order": "sequential",
     "output_format": "tsv",
-    "num_threads": 2,
-    "target_cards": 10
+    "target_cards": 10,
+    "validate": "true"
 }
 
 CONFIG_DESC = {
@@ -31,23 +30,53 @@ CONFIG_DESC = {
     "max_tokens": "Maximum tokens per Ollama request",
     "chunk_order": "Order of chunks: sequential, reverse, random",
     "output_format": "Output file format: tsv, csv, jsonl",
-    "num_threads": "Number of concurrent Ollama workers" ,
-    "target_cards": "Number of cards to make per chunk"
+    "target_cards": "Number of cards per chunk",
+    "validate": "Remove low-quality flashcards: true,false"
 }
 
 CONFIG_FILE = Path("flashcards.conf")
+REJECTED_FILE = "rejected.tsv"
 
 # =====================
-# CONFIG UTILITIES
+# PROMPTS
+# =====================
+PROMPT_TEMPLATE = """
+You are generating HIGH-DENSITY and EXHAUSTIVE flashcards.
+Ignore any content that is not relevant to the topic of {topic}.
+Extract EVERY detail. Every fact → at least one flashcard.
+Each flashcard should be useful for studying for an exam.
+Each flashcard must have a stand-alone question. 
+Cards about key terms must ask the question as "What is a [key term]?"
+If there are no relevant details, print "NONE".
+Aim to produce {limit} cards.
+Output EXACTLY one question<TAB>answer per line, no numbering, no markdown.
+
+Text:
+{chunk}
+
+Flashcards:
+"""
+
+VALIDATION_PROMPT = """
+Verify that the following flashcard is useful and relevant.
+It should regard the topic(s) of {topic}.
+Respond only YES if the card is good and only NO if the card is bad.
+"""
+
+if Path("./prompt.acd").is_file():
+    with open("./prompt.acd") as f:
+        PROMPT_TEMPLATE = f.read()
+        print("Loaded alternate prompt")
+
+def build_prompt(topic, chunk, limit):
+    return PROMPT_TEMPLATE.format(topic=topic, chunk=chunk, limit=limit)
+
+# =====================
+# UTILITIES
 # =====================
 def check_ollama_running():
     try:
-        subprocess.run(
-            ["ollama", "list"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True
-        )
+        subprocess.run(["ollama", "list"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         return True
     except Exception:
         return False
@@ -56,9 +85,9 @@ def load_config():
     if CONFIG_FILE.exists():
         try:
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            for k, v in DEFAULT_CONFIG.items():
+            for k,v in DEFAULT_CONFIG.items():
                 if k not in cfg:
-                    cfg[k] = v
+                    cfg[k]=v
             return cfg
         except Exception:
             return DEFAULT_CONFIG.copy()
@@ -71,226 +100,164 @@ def save_config(cfg):
     except Exception as e:
         print(f"Error saving config: {e}")
 
-# =====================
-# CHUNKING
-# =====================
 def chunk_text(text, size, overlap):
     start = 0
     n = len(text)
     while start < n:
-        end = min(start + size, n)
+        end = min(start+size, n)
         yield text[start:end]
         start = end - overlap if end - overlap > start else end
 
-# =====================
-# PROMPT BUILDER
-# =====================
-PROMPT_TEMPLATE = """
-You are generating HIGH-DENSITY and EXHAUSTIVE flashcards.
-Ignore any content that is not relevant to the topic of {topic}.
-Extract EVERY detail. Every fact → at least one flashcard.
-Each flashcard should be useful for studying for an exam.
-Each flashcard must have a stand-alone question. 
-Cards about key terms must ask the question as "What is a [key term]?"
-If there are no relevant details, print "NONE".
-Aim to produce {limit} cards, unless there are more important details.
-Output EXACTLY one question<TAB>answer per line, no numbering, no markdown.
-Output Template:
-[Question] <TAB> [Answer]
-=========================
-Text:
-=========================
-{chunk}
-=========================
-
-Flashcards:
-"""
-
-if Path("./prompt.acd").is_file():
-    with open("./prompt.acd") as promptFile:
-        PROMPT_TEMPLATE = promptFile.read()
-        print('Loaded alternate prompt')
-
-def build_prompt(topic, chunk, limit):
-    return PROMPT_TEMPLATE.format(topic=topic, chunk=chunk,limit=limit)
-
-# =====================
-# THREAD WORKER FOR OLAMA
-# =====================
-def ollama_worker(model, prompt, line_queue, stop_event):
-    """Runs Ollama subprocess and pushes lines to queue"""
-    try:
-        proc = subprocess.Popen(
-            ["ollama", "run", model],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1
-        )
-        proc.stdin.write(prompt)
-        proc.stdin.close()
-        for line in proc.stdout:
-            if stop_event.is_set():
-                break
-            line_queue.put(line.rstrip("\n"))
-        proc.stdout.close()
-        proc.wait()
-    except Exception as e:
-        line_queue.put(f"[ERROR] Ollama worker failed: {e}")
-
-def chunk_worker(cfg, task_queue, line_queue, stop_event):
-    """Worker that processes DIFFERENT chunks by pulling from task_queue."""
-    while not stop_event.is_set():
-        try:
-            chunk_index, pass_num, chunk = task_queue.get(timeout=0.1)
-        except queue.Empty:
-            return
-
-        prompt = build_prompt(cfg["topic"], chunk, cfg["target_cards"])
-
-        try:
-            proc = subprocess.Popen(
-                ["ollama", "run", cfg["model"]],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1
-            )
-            proc.stdin.write(prompt)
-            proc.stdin.close()
-
-            for line in proc.stdout:
-                if stop_event.is_set():
-                    break
-                line_queue.put((chunk_index, pass_num, line.rstrip("\n")))
-
-            proc.stdout.close()
-            proc.wait()
-
-        except Exception as e:
-            line_queue.put((chunk_index, pass_num, f"[ERROR] Worker failed: {e}"))
-
-        task_queue.task_done()
-
-# =====================
-# FLASHCARD EXTRACTION (TAB OR <TAB>)
-# =====================
 def extract_lines(lines, output_format="tsv"):
     for line in lines:
         line = line.strip()
-        if not line:
-            continue
-
-        if "<TAB>" in line:
-            line = line.replace("<TAB>", "\t")
-
+        if not line or line.upper() == "NONE": continue
+        if "<TAB>" in line: line=line.replace("<TAB>","\t")
         if "\t" in line:
-            q, a = map(str.strip, line.split("\t", 1))
+            q,a = map(str.strip,line.split("\t",1))
         elif "  " in line:
             parts = re.split(r"\s{2,}", line, maxsplit=1)
-            if len(parts) != 2:
-                continue
-            q, a = map(str.strip, parts)
+            if len(parts)!=2: continue
+            q,a = map(str.strip,parts)
         else:
             continue
-
-        if not q or not a:
-            continue
-
-        if output_format == "tsv":
-            yield f"{q}\t{a}\n"
-        elif output_format == "csv":
+        if not q or not a: continue
+        if output_format=="tsv": yield f"{q}\t{a}\n"
+        elif output_format=="csv":
             import csv
             from io import StringIO
-            out = StringIO()
-            writer = csv.writer(out)
-            writer.writerow([q, a])
+            out=StringIO()
+            writer=csv.writer(out)
+            writer.writerow([q,a])
             yield out.getvalue()
-        elif output_format == "jsonl":
-            yield json.dumps({"question": q, "answer": a}) + "\n"
+        elif output_format=="jsonl":
+            yield json.dumps({"question":q,"answer":a})+"\n"
 
 # =====================
 # DASHBOARD
 # =====================
 class Dashboard:
     SPINNER = ["|","/","-","\\"]
-
-    def __init__(self, stdscr, total_chunks):
+    def __init__(self, stdscr, total_chunks, max_rows=10):
         self.stdscr = stdscr
         self.total_chunks = total_chunks
         self.chunk = 0
         self.pass_num = 0
-        self.flashcards = 0
+        self.generated = 0
+        self.validated = 0
+        self.rejected = 0
         self.logs = []
+        self.live_lines = []
         self.spinner_index = 0
+        self.chunk_pass_history = []
+        self.max_rows = max_rows
         curses.start_color()
         curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_GREEN,-1)
-        curses.init_pair(2, curses.COLOR_YELLOW,-1)
-        curses.init_pair(3, curses.COLOR_RED,-1)
-        curses.init_pair(4, curses.COLOR_CYAN,-1)
-        curses.init_pair(5, curses.COLOR_WHITE,-1)
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        curses.init_pair(3, curses.COLOR_RED, -1)
+        curses.init_pair(4, curses.COLOR_CYAN, -1)
+        curses.init_pair(5, curses.COLOR_WHITE, -1)
 
     def log_event(self, msg, level="INFO"):
         ts = datetime.now().strftime("%H:%M:%S")
-        self.logs.append(f"[{ts}][{level}] {msg}")
-        if len(self.logs) > 20:
-            self.logs = self.logs[-20:]
+        formatted = f"[{ts}][{level}] {msg}"
+        self.logs.append(formatted)
+
+    def draw_graph(self, row, w):
+        total = max(1, self.generated)
+        bar_width = w - 40
+        val_len = int(self.validated / total * bar_width)
+        rej_len = int(self.rejected / total * bar_width)
+        pending_len = max(0, bar_width - val_len - rej_len)
+        x = 0
+        if val_len: self.stdscr.addstr(row, x, "#"*val_len, curses.color_pair(1)); x+=val_len
+        if rej_len: self.stdscr.addstr(row, x, "!"*rej_len, curses.color_pair(3)); x+=rej_len
+        if pending_len: self.stdscr.addstr(row, x, "."*pending_len, curses.color_pair(4))
+        label = f"Generated: {self.generated} Validated: {self.validated} Rejected: {self.rejected}"
+        self.stdscr.addstr(row, max(x+1, w-len(label)-1), label, curses.color_pair(5)|curses.A_BOLD)
+
+    def draw_chunk_matrix(self, start_row, start_col, h, w):
+        history = self.chunk_pass_history[-h:]
+        for i, chunk_row in enumerate(history):
+            y = start_row + i
+            x = start_col
+            for gen,val,rej in chunk_row:
+                total = max(1, gen)
+                val_len = int(val / total * 1)
+                rej_len = int(rej / total * 1)
+                if val_len: self.stdscr.addstr(y,x,"#",curses.color_pair(1))
+                elif rej_len: self.stdscr.addstr(y,x,"!",curses.color_pair(3))
+                else: self.stdscr.addstr(y,x,".",curses.color_pair(4))
+                x += 1
 
     def draw(self):
         self.stdscr.erase()
-        h,w = self.stdscr.getmaxyx()
+        h, w = self.stdscr.getmaxyx()
         try:
             self.stdscr.addstr(0,0,f"Autocard {VERSION}",curses.color_pair(1)|curses.A_BOLD)
             self.stdscr.addstr(2,0,f"Chunk: {self.chunk}/{self.total_chunks}",curses.color_pair(4))
             self.stdscr.addstr(3,0,f"Pass:  {self.pass_num}",curses.color_pair(4))
             pct = int((self.chunk/self.total_chunks)*100) if self.total_chunks else 0
-            bar_width = min(30, w-20)
+            bar_width = min(30,w-20)
             filled = int(bar_width*pct/100)
-            bar = "["+"#"*filled+"-"*(bar_width-filled)+"]"
+            bar = "[" + "#"*filled + "-"*(bar_width-filled) + "]"
             self.stdscr.addstr(4,0,f"Progress: {bar} {pct}%",curses.color_pair(1))
             spinner = self.SPINNER[self.spinner_index % len(self.SPINNER)]
             self.stdscr.addstr(5,0,f"Running: {spinner}",curses.color_pair(2))
-            self.stdscr.addstr(6,0,f"Flashcards extracted: {self.flashcards}",curses.color_pair(1))
-            self.stdscr.addstr(8,0,"Logs:",curses.color_pair(5)|curses.A_BOLD)
-            for i, log in enumerate(self.logs[-12:]):
-                if 9+i < h-2:
-                    self.stdscr.addstr(9+i,2,log[:w-4])
-            self.stdscr.addstr(h-2,0,"Press 'c' for config | 'q' to quit",curses.color_pair(5)|curses.A_BOLD)
+
+            # Chunk/pass matrix
+            graph_w = 30
+            graph_h = min(self.max_rows, len(self.chunk_pass_history))
+            self.draw_chunk_matrix(2, w - graph_w - 1, graph_h, graph_w)
+
+            # Main graph
+            graph_row = 7
+            self.draw_graph(graph_row, w)
+
+            # Live generated lines
+            live_start = graph_row + 2
+            max_lines = h - live_start - 2
+            lines_to_show = self.live_lines[-max_lines:] if self.live_lines else []
+            for i in range(max_lines):
+                if i < len(lines_to_show):
+                    line = lines_to_show[i]
+                    self.stdscr.addstr(live_start + i, 0, line[:w-1], curses.color_pair(5))
+                else:
+                    self.stdscr.addstr(live_start + i, 0, " "*(w-1))
+
+            self.stdscr.addstr(h-1,0,"Press 'c' for config | 'q' to quit",curses.color_pair(5)|curses.A_BOLD)
         except curses.error:
             pass
         self.stdscr.refresh()
-        self.spinner_index+=1
+        self.spinner_index += 1
 
 # =====================
 # CONFIG MODAL
 # =====================
-def config_modal(stdscr, cfg, dashboard=None):
+def config_modal(stdscr,cfg,dashboard=None):
     curses.curs_set(1)
-    h,w = stdscr.getmaxyx()
-    win_h = len(cfg)+4
-    win = curses.newwin(win_h, w-4, max(0,h//2-win_h//2),2)
+    h,w=stdscr.getmaxyx()
+    win_h=len(cfg)+4
+    win=curses.newwin(win_h,w-4,max(0,h//2-win_h//2),2)
     win.keypad(True)
     win.nodelay(True)
     win.box()
     win.addstr(0,2,"CONFIGURATION MENU (ESC to exit)")
-
-    keys = list(cfg.keys())
-    selected = 0
-    input_mode = False
-    buffer = ""
+    keys=list(cfg.keys())
+    selected=0
+    input_mode=False
+    buffer=""
     while True:
         if dashboard: dashboard.draw()
         for i,k in enumerate(keys):
             val=str(cfg[k])
-            desc = CONFIG_DESC.get(k,"")
-            prefix = "-> " if i==selected else "   "
+            desc=CONFIG_DESC.get(k,"")
+            prefix="-> " if i==selected else "   "
             try: win.addstr(1+i,2,f"{prefix}{k}: {val} ({desc})".ljust(w-6))
             except curses.error: pass
         win.refresh()
-        c = win.getch()
+        c=win.getch()
         if c==-1: time.sleep(0.05); continue
         if input_mode:
             if c in [10,13]:
@@ -310,130 +277,103 @@ def config_modal(stdscr, cfg, dashboard=None):
     if dashboard: dashboard.draw()
 
 # =====================
-# GENERATOR LOOP
+# GENERATION + VALIDATION + LIVE DISPLAY
 # =====================
-def run_generator(stdscr, infile, outfile, cfg):
+def run_generator(stdscr,infile,outfile,cfg):
     curses.curs_set(0)
-
-    # Load input text & chunk it
     text = Path(infile).read_text(encoding="utf-8")
     chunks = list(chunk_text(text, cfg["chunk_size"], cfg["overlap"]))
-    if cfg["chunk_order"] == "reverse":
-        chunks = list(reversed(chunks))
-    elif cfg["chunk_order"] == "random":
-        random.shuffle(chunks)
+    if cfg["chunk_order"]=="reverse": chunks=list(reversed(chunks))
+    elif cfg["chunk_order"]=="random": random.shuffle(chunks)
 
-    dash = Dashboard(stdscr, len(chunks))
+    dash = Dashboard(stdscr,len(chunks))
     dash.draw()
-    dash.log_event("Starting up ...","INFO")
+    dash.log_event("Starting up ...", "INFO")
 
-    # Reset output file
-    Path(outfile).write_text("", encoding="utf-8")
-    tsv_count = 0
+    Path(outfile).write_text("",encoding="utf-8")
+    Path(REJECTED_FILE).write_text("",encoding="utf-8")
 
-    # Shared thread state
-    stop_event = threading.Event()
-    line_queue = queue.Queue()
-    task_queue = queue.Queue()
-    write_lock = threading.Lock()
-
-    # -------------------------
-    # Build task queue
-    # -------------------------
     for ci, chunk in enumerate(chunks, start=1):
-        chunk_preview = chunk.replace("\n", " ").strip()
-        if len(chunk_preview) > 100:
-            chunk_preview = chunk_preview[:100] + "..."
-        dash.log_event(f"Chunk preview: {chunk_preview}", "DEBUG")
-
-        for p in range(1, cfg["num_passes"] + 1):
-            task_queue.put((ci, p, chunk))
-
-    # -------------------------
-    # Start parallel workers
-    # -------------------------
-    workers = []
-    for _ in range(cfg["num_threads"]):
-        t = threading.Thread(
-            target=chunk_worker,
-            args=(cfg, task_queue, line_queue, stop_event),
-            daemon=True
-        )
-        t.start()
-        workers.append(t)
-
-    dash.log_event(f"Started {len(workers)} parallel chunk workers", "INFO")
-
-    # -------------------------
-    # Process model output lines
-    # -------------------------
-    while any(w.is_alive() for w in workers) or not line_queue.empty():
-        try:
-            ci, p, line = line_queue.get(timeout=0.1)
-        except queue.Empty:
-            dash.draw()
-            continue
-
         dash.chunk = ci
-        dash.pass_num = p
-        dash.log_event(f"Ollama output: {line}", "INFO")
+        dash.pass_num = 0
+        dash.live_lines = []
+        chunk_generated = []
 
-        # Extract flashcards from the line
-        for extracted in extract_lines([line], cfg["output_format"]):
-            with write_lock:
-                with open(outfile, "a", encoding="utf-8") as f:
-                    f.write(extracted)
-
-            tsv_count += 1
-            dash.flashcards = tsv_count
-            dash.log_event(f"Extracted: {extracted.strip()}", "DEBUG")
-
-        line_queue.task_done()
-        dash.draw()
-
-        # Handle keyboard input
-        stdscr.nodelay(True)
-        key = stdscr.getch()
-
-        if key == ord('q'):
-            stop_event.set()
-            break
-
-        elif key == ord('c'):
-            dash.log_event("Paused execution for configuration.","INFO")
-            # Pause workers
-            stop_event.set()
-            for w in workers:
-                w.join()
-
-            # change config
-            config_modal(stdscr, cfg, dashboard=dash)
-
-            # Resume
-            stop_event.clear()
-            workers = []
-            for _ in range(cfg["num_threads"]):
-                t = threading.Thread(
-                    target=chunk_worker,
-                    args=(cfg, task_queue, line_queue, stop_event),
-                    daemon=True
+        for p in range(1, cfg["num_passes"]+1):
+            dash.pass_num = p
+            prompt = build_prompt(cfg["topic"], chunk, cfg["target_cards"])
+            try:
+                proc = subprocess.Popen(
+                    ["ollama","run",cfg["model"]],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True, bufsize=1
                 )
-                t.start()
-                workers.append(t)
-            dash.log_event("Workers restarted after config change", "DEBUG")
+                proc.stdin.write(prompt+"\n")
+                proc.stdin.flush()
+                proc.stdin.close()
 
-    # -------------------------
-    # Shutdown
-    # -------------------------
-    stop_event.set()
-    task_queue.join()
+                while True:
+                    line = proc.stdout.readline()
+                    if not line:
+                        if proc.poll() is not None: break
+                        time.sleep(0.01)
+                        dash.draw()
+                        stdscr.nodelay(True)
+                        key = stdscr.getch()
+                        if key==ord('q'): return
+                        elif key==ord('c'): config_modal(stdscr,cfg,dashboard=dash)
+                        continue
+                    line = line.strip()
+                    if not line: continue
+                    chunk_generated.append(line)
+                    dash.generated += 1
+                    dash.live_lines.append(line)
+                    dash.log_event(f"Generated card: {line}", "INFO")
+                    dash.draw()
+            except Exception as e:
+                dash.log_event(f"[ERROR] Generation failed: {e}", "ERROR")
 
-    for w in workers:
-        w.join()
+        # Validation
+        validated_lines = []
+        for line in chunk_generated:
+            if cfg.get("validate","true").lower() != "true":
+                validated_lines.append(line)
+                dash.validated += 1
+                continue
+            val_prompt = VALIDATION_PROMPT.format(topic=cfg["topic"]) + "\n" + line
+            try:
+                val_proc = subprocess.Popen(
+                    ["ollama","run",cfg["model"]],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                stdout_val,_ = val_proc.communicate(val_prompt, timeout=30)
+                if "NO" in stdout_val.upper():
+                    dash.rejected += 1
+                    with open(REJECTED_FILE,"a",encoding="utf-8") as f:
+                        f.write(line+"\n")
+                    dash.log_event(f"Rejected card: {line}", "WARN")
+                else:
+                    validated_lines.append(line)
+                    dash.validated += 1
+                    dash.log_event(f"Validated card: {line}", "INFO")
+                dash.draw()
+            except Exception as e:
+                dash.log_event(f"[ERROR] Validation failed: {e}", "ERROR")
+                dash.draw()
 
-    dash.log_event("All chunks processed. Done!", "INFO")
+        with open(outfile,"a",encoding="utf-8") as f:
+            for line in validated_lines:
+                f.write(line+"\n")
+
+        dash.chunk_pass_history.append([(len(chunk_generated), dash.validated, dash.rejected)])
+
+    dash.log_event("All chunks processed. Done!","INFO")
     dash.draw()
-
     stdscr.nodelay(False)
     stdscr.getch()
 
@@ -441,19 +381,21 @@ def run_generator(stdscr, infile, outfile, cfg):
 # MAIN
 # =====================
 def main(stdscr):
-    if len(sys.argv)!=3:
-        print("Usage: flashcards.py [input.txt] [output.tsv]",flush=True)
-        sys.exit(1)
-    if not check_ollama_running():
-        print("ERROR: Ollama is not running. Start it with 'ollama serve'",flush=True)
-        sys.exit(2)
     infile = sys.argv[1]
     outfile = sys.argv[2]
     cfg = load_config()
     config_modal(stdscr,cfg)
     run_generator(stdscr,infile,outfile,cfg)
 
-if __name__=="__main__":
-    curses.wrapper(main)
+def check_environment():
+    if len(sys.argv)!=3:
+        print("Usage: flashcards.py [input.txt] [output.tsv]",flush=True)
+        sys.exit(1)
+    if not check_ollama_running():
+        print("ERROR: Ollama is not running. Start it with 'ollama serve'",flush=True)
+        sys.exit(2)
 
+if __name__=="__main__":
+    check_environment()
+    curses.wrapper(main)
 
