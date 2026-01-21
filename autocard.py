@@ -4,9 +4,6 @@ from pathlib import Path
 
 VERSION = 2.8  # Updated version
 
-# =====================
-# DEFAULT CONFIG
-# =====================
 DEFAULT_CONFIG = {
     "model": "llama3:8b",
     "chunk_size": 1600,
@@ -35,9 +32,6 @@ CONFIG_DESC = {
 
 CONFIG_FILE = Path("flashcards.conf")
 
-# =====================
-# PROMPTS
-# =====================
 PROMPT_TEMPLATE = """
 You are generating HIGH-DENSITY and EXHAUSTIVE flashcards.
 Ignore any content that is not relevant to the topic of {topic}.
@@ -73,9 +67,6 @@ if Path("./prompt.acd").is_file():
 def build_prompt(topic, chunk, limit):
     return PROMPT_TEMPLATE.format(topic=topic, chunk=chunk, limit=limit)
 
-# =====================
-# UTILITIES
-# =====================
 def check_ollama_running():
     try:
         subprocess.run(["ollama", "list"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -110,9 +101,6 @@ def chunk_text(text, size, overlap):
         yield text[start:end]
         start = end - overlap if end - overlap > start else end
 
-# =====================
-# DASHBOARD
-# =====================
 class Dashboard:
     SPINNER = ["|","/","-","\\"]
     def __init__(self, stdscr, total_chunks, max_rows=10):
@@ -203,16 +191,13 @@ class Dashboard:
                 spinner = self.SPINNER[self.spinner_index % len(self.SPINNER)]
                 self.stdscr.addstr(5,0,f"Running: {spinner}",curses.color_pair(2))
 
-                # Chunk/pass matrix
                 graph_w = 30
                 graph_h = min(self.max_rows, len(self.chunk_pass_history))
                 self.draw_chunk_matrix(2, w - graph_w - 1, graph_h, graph_w)
 
-                # Main graph
                 graph_row = 7
                 self.draw_graph(graph_row, w)
 
-                # Live generated lines
                 live_start = graph_row + 2
                 max_lines = h - live_start - 2
                 lines_to_show = self.live_lines[-max_lines:] if self.live_lines else []
@@ -228,9 +213,6 @@ class Dashboard:
                 pass
             self.stdscr.refresh()
 
-# =====================
-# CONFIG MODAL
-# =====================
 def config_modal(stdscr,cfg,dashboard=None):
     curses.curs_set(1)
     h,w=stdscr.getmaxyx()
@@ -272,9 +254,6 @@ def config_modal(stdscr,cfg,dashboard=None):
     save_config(cfg)
     if dashboard: dashboard.draw()
 
-# =====================
-# RUN GENERATOR
-# =====================
 def run_generator(stdscr,infile,outfile,cfg):
     curses.curs_set(0)
     text = Path(infile).read_text(encoding="utf-8")
@@ -329,10 +308,8 @@ def run_generator(stdscr,infile,outfile,cfg):
             except Exception as e:
                 dash.log_event(f"Generation failed: {e}", "ERROR")
 
-        # Per-chunk validation
         validated_lines = []
         for line in chunk_generated:
-            # Normalize line to TSV format: replace <TAB>, "TAB", multiple spaces with a real tab
             line = re.sub(r"<TAB>|TAB", "\t", line, flags=re.IGNORECASE)  # replace placeholders
             line = re.sub(r" {2,}", "\t", line)  # replace 2+ spaces with a tab
             line = line.strip()
@@ -378,9 +355,6 @@ def run_generator(stdscr,infile,outfile,cfg):
     dash.running = False
     stdscr.getch()
 
-# =====================
-# MAIN
-# =====================
 def main(stdscr):
     infile = sys.argv[1]
     outfile = sys.argv[2]
