@@ -1,4 +1,0 @@
-ollama
-pyautogui
-pyperclip
-windows-curses # On windows systems only
